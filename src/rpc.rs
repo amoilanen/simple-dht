@@ -46,9 +46,61 @@ pub enum RpcRequest {
     FindNode(DhtKey),
     Store(DhtKey, Vec<u8>),
     FindValue(DhtKey),
+    //Below are extension requests for the original DHT protocol:
     GetNodeId(DhtKey, SocketAddr),
-    StoreString(String, String),
-    FindStringValue(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum KeyWrapper {
+    String(String),
+    Key(DhtKey),
+}
+
+impl From<KeyWrapper> for DhtKey {
+    fn from(wrapper: KeyWrapper) -> Self {
+        match wrapper {
+            KeyWrapper::String(s) => DhtKey::from(s.as_str()),
+            KeyWrapper::Key(k) => k,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ValueWrapper {
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+impl From<ValueWrapper> for Vec<u8> {
+    fn from(wrapper: ValueWrapper) -> Self {
+        match wrapper {
+            ValueWrapper::String(s) => s.into_bytes(),
+            ValueWrapper::Bytes(b) => b,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RpcRequestWrapper {
+    Ping,
+    FindNode(KeyWrapper),
+    Store(KeyWrapper, ValueWrapper),
+    FindValue(KeyWrapper),
+    GetNodeId(KeyWrapper, SocketAddr),
+}
+
+impl From<RpcRequestWrapper> for RpcRequest {
+    fn from(wrapper: RpcRequestWrapper) -> Self {
+        match wrapper {
+            RpcRequestWrapper::Ping => RpcRequest::Ping,
+            RpcRequestWrapper::FindNode(key) => RpcRequest::FindNode(key.into()),
+            RpcRequestWrapper::Store(key, value) => RpcRequest::Store(key.into(), value.into()),
+            RpcRequestWrapper::FindValue(key) => RpcRequest::FindValue(key.into()),
+            RpcRequestWrapper::GetNodeId(key, addr) => RpcRequest::GetNodeId(key.into(), addr),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,7 +111,6 @@ pub enum RpcResponse {
     NotFound,
     Ok,
     NodeId(DhtKey),
-    ValueString(String),
 }
 
 pub struct RpcServer {
@@ -94,9 +145,11 @@ impl RpcServer {
         let mut line = String::new();
 
         while reader.read_line(&mut line).await? > 0 {
-            //println!("Received raw request = {}", &line);
-            let request: RpcRequest = serde_json::from_str(&line)?;
-            //println!("Parsed request = {:?}", request);
+            println!("Received raw request = {}", &line);
+            let wrapper_request: RpcRequestWrapper = serde_json::from_str(&line)?;
+            println!("Parsed wrapper request = {:?}", wrapper_request);
+            
+            let request: RpcRequest = wrapper_request.into();
             let response = Self::handle_request(&node, request, peer_addr.clone()).await?;
             w.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
             w.write_all(b"\n").await?;
@@ -137,23 +190,6 @@ impl RpcServer {
                 };
                 node.routing_table.lock().await.update(sender_node);
                 Ok(RpcResponse::NodeId(node.id.clone()))
-            },
-
-            RpcRequest::StoreString(key, value) => {
-                let mut storage = node.storage.lock().await;
-                storage.store(DhtKey::from(key.as_str()), value.into_bytes(), None);
-                Ok(RpcResponse::Ok)
-            },
-
-            RpcRequest::FindStringValue(key) => {
-                let storage = node.storage.lock().await;
-                match storage.get(&DhtKey::from(key.as_str())) {
-                    Some(value) => match String::from_utf8(value.to_vec()) {
-                        Ok(str_value) => Ok(RpcResponse::ValueString(str_value)),
-                        Err(_) => Ok(RpcResponse::NotFound),
-                    },
-                    None => Ok(RpcResponse::NotFound),
-                }
             },
         }
     }
@@ -209,6 +245,12 @@ mod tests {
     impl From<JoinError> for TestError {
         fn from(err: JoinError) -> Self {
             TestError(RpcError::ConnectionError(err.to_string()))
+        }
+    }
+
+    impl From<serde_json::Error> for TestError {
+        fn from(err: serde_json::Error) -> Self {
+            TestError(RpcError::SerializationError(err))
         }
     }
 
@@ -353,46 +395,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_string_operations() -> Result<(), TestError> {
-        let node = create_test_node();
-        let server = RpcServer::new(node.clone());
+    async fn test_key_and_value_wrapper_string_variants() -> Result<(), TestError> {
+        let key_wrapper = KeyWrapper::String("test_key".to_string());
+        let value_wrapper = ValueWrapper::String("test_value".to_string());
+
+        let dht_key: DhtKey = key_wrapper.into();
+        let value_bytes: Vec<u8> = value_wrapper.into();
+        assert!(dht_key.to_string().len() > 0);
+        assert_eq!(value_bytes, b"test_value");
+
+        let request = RpcRequestWrapper::Store(
+            KeyWrapper::String("my_key".to_string()),
+            ValueWrapper::String("my_value".to_string())
+        );
         
-        let server_handle = tokio::spawn(async move {
-            server.start().await.unwrap();
-        });
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let client = RpcClient::new(node.addr);
-
-        let key = "test_key".to_string();
-        let value = "test value".to_string();
-
-        let response = client.send_request(RpcRequest::StoreString(key.clone(), value.clone())).await?;
-        assert!(matches!(response, RpcResponse::Ok));
-
-        let response = client.send_request(RpcRequest::FindStringValue(key.clone())).await?;
-        match response {
-            RpcResponse::ValueString(v) => assert_eq!(v, value),
-            _ => panic!("Expected ValueString response"),
+        let serialized = serde_json::to_string(&request)?;
+        let deserialized: RpcRequestWrapper = serde_json::from_str(&serialized)?;
+        
+        match deserialized {
+            RpcRequestWrapper::Store(key, value) => {
+                let dht_key: DhtKey = key.into();
+                let bytes: Vec<u8> = value.into();
+                assert!(dht_key.to_string().len() > 0);
+                assert_eq!(bytes, b"my_value");
+            },
+            _ => panic!("Expected Store variant"),
         }
 
-        let response = client.send_request(RpcRequest::FindStringValue("non_existent_key".to_string())).await?;
-        assert!(matches!(response, RpcResponse::NotFound));
-
-        let special_key = "special_🚀_key".to_string();
-        let special_value = "value with 👋 emoji and spaces".to_string();
+        let mixed_request = RpcRequestWrapper::Store(
+            KeyWrapper::String("mixed_key".to_string()),
+            ValueWrapper::Bytes(vec![1, 2, 3])
+        );
         
-        let response = client.send_request(RpcRequest::StoreString(special_key.clone(), special_value.clone())).await?;
-        assert!(matches!(response, RpcResponse::Ok));
-
-        let response = client.send_request(RpcRequest::FindStringValue(special_key)).await?;
-        match response {
-            RpcResponse::ValueString(v) => assert_eq!(v, special_value),
-            _ => panic!("Expected ValueString response"),
+        let serialized = serde_json::to_string(&mixed_request)?;
+        let deserialized: RpcRequestWrapper = serde_json::from_str(&serialized)?;
+        
+        match deserialized {
+            RpcRequestWrapper::Store(key, value) => {
+                let dht_key: DhtKey = key.into();
+                let bytes: Vec<u8> = value.into();
+                assert!(dht_key.to_string().len() > 0);
+                assert_eq!(bytes, vec![1, 2, 3]);
+            },
+            _ => panic!("Expected Store variant"),
         }
 
-        server_handle.abort();
+        let find_request = RpcRequestWrapper::FindNode(KeyWrapper::String("find_key".to_string()));
+        let serialized = serde_json::to_string(&find_request)?;
+        let deserialized: RpcRequestWrapper = serde_json::from_str(&serialized)?;
+
+        match deserialized {
+            RpcRequestWrapper::FindNode(key) => {
+                let dht_key: DhtKey = key.into();
+                assert!(dht_key.to_string().len() > 0);
+            },
+            _ => panic!("Expected FindNode variant"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_key_and_value_wrapper_parsing() -> Result<(), TestError> {
+        let json_str = r#"{"Store": ["test_key", "test_value"]}"#;
+        let wrapper: RpcRequestWrapper = serde_json::from_str(json_str)?;
+        let request: RpcRequest = wrapper.into();
+        match request {
+            RpcRequest::Store(key, value) => {
+                assert_eq!(value, b"test_value");
+            },
+            _ => panic!("Expected Store variant"),
+        }
+
+        let test_key = DhtKey::random();
+        let test_value = vec![1, 2, 3, 4];
+        let json_str = format!(
+            r#"{{"Store": [{}, {}]}}"#,
+            serde_json::to_string(&test_key)?,
+            serde_json::to_string(&test_value)?
+        );
+        let wrapper: RpcRequestWrapper = serde_json::from_str(&json_str)?;
+        let request: RpcRequest = wrapper.into();
+        
+        match request {
+            RpcRequest::Store(key, value) => {
+                assert_eq!(value, test_value);
+            },
+            _ => panic!("Expected Store variant"),
+        }
+
         Ok(())
     }
 } 
