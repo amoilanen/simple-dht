@@ -1,4 +1,1 @@
-* Test locally
-* Make all unit tests pass - DONE
-* Make the integration tests pass - DONE
-* Make the end-to-end tests pass
+* Migrate away from JSON to a binary data exchange format for RPC messages?

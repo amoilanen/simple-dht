@@ -47,6 +47,8 @@ pub enum RpcRequest {
     Store(DhtKey, Vec<u8>),
     FindValue(DhtKey),
     GetNodeId(DhtKey, SocketAddr),
+    StoreString(String, String),
+    FindStringValue(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +59,7 @@ pub enum RpcResponse {
     NotFound,
     Ok,
     NodeId(DhtKey),
+    ValueString(String),
 }
 
 pub struct RpcServer {
@@ -91,7 +94,9 @@ impl RpcServer {
         let mut line = String::new();
 
         while reader.read_line(&mut line).await? > 0 {
+            //println!("Received raw request = {}", &line);
             let request: RpcRequest = serde_json::from_str(&line)?;
+            //println!("Parsed request = {:?}", request);
             let response = Self::handle_request(&node, request, peer_addr.clone()).await?;
             w.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
             w.write_all(b"\n").await?;
@@ -132,6 +137,23 @@ impl RpcServer {
                 };
                 node.routing_table.lock().await.update(sender_node);
                 Ok(RpcResponse::NodeId(node.id.clone()))
+            },
+
+            RpcRequest::StoreString(key, value) => {
+                let mut storage = node.storage.lock().await;
+                storage.store(DhtKey::from(key.as_str()), value.into_bytes(), None);
+                Ok(RpcResponse::Ok)
+            },
+
+            RpcRequest::FindStringValue(key) => {
+                let storage = node.storage.lock().await;
+                match storage.get(&DhtKey::from(key.as_str())) {
+                    Some(value) => match String::from_utf8(value.to_vec()) {
+                        Ok(str_value) => Ok(RpcResponse::ValueString(str_value)),
+                        Err(_) => Ok(RpcResponse::NotFound),
+                    },
+                    None => Ok(RpcResponse::NotFound),
+                }
             },
         }
     }
@@ -324,6 +346,50 @@ mod tests {
         match response {
             RpcResponse::NodeId(id) => assert_eq!(id, node.id),
             _ => panic!("Expected NodeId response"),
+        }
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_string_operations() -> Result<(), TestError> {
+        let node = create_test_node();
+        let server = RpcServer::new(node.clone());
+        
+        let server_handle = tokio::spawn(async move {
+            server.start().await.unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let client = RpcClient::new(node.addr);
+
+        let key = "test_key".to_string();
+        let value = "test value".to_string();
+
+        let response = client.send_request(RpcRequest::StoreString(key.clone(), value.clone())).await?;
+        assert!(matches!(response, RpcResponse::Ok));
+
+        let response = client.send_request(RpcRequest::FindStringValue(key.clone())).await?;
+        match response {
+            RpcResponse::ValueString(v) => assert_eq!(v, value),
+            _ => panic!("Expected ValueString response"),
+        }
+
+        let response = client.send_request(RpcRequest::FindStringValue("non_existent_key".to_string())).await?;
+        assert!(matches!(response, RpcResponse::NotFound));
+
+        let special_key = "special_🚀_key".to_string();
+        let special_value = "value with 👋 emoji and spaces".to_string();
+        
+        let response = client.send_request(RpcRequest::StoreString(special_key.clone(), special_value.clone())).await?;
+        assert!(matches!(response, RpcResponse::Ok));
+
+        let response = client.send_request(RpcRequest::FindStringValue(special_key)).await?;
+        match response {
+            RpcResponse::ValueString(v) => assert_eq!(v, special_value),
+            _ => panic!("Expected ValueString response"),
         }
 
         server_handle.abort();
