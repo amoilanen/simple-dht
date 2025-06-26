@@ -66,8 +66,12 @@ impl DhtNode {
             all_found_nodes.push(node.clone());
         }
 
+        let mut consecutive_empty_responses = 0;
+        const MAX_EMPTY_RESPONSES: usize = 3;
+
         while !current_closest.is_empty() && all_found_nodes.len() < ALPHA {
             let mut new_closest = Vec::new();
+            let mut found_any_new_nodes = false;
 
             for node in current_closest {
                 if queried.contains(&node.id) {
@@ -82,13 +86,22 @@ impl DhtNode {
                             found.insert(new_node.id.clone());
                             all_found_nodes.push(new_node.clone());
                             new_closest.push(new_node.clone());
-                            // Ping and add new nodes to routing table
+                            found_any_new_nodes = true;
                             if let Err(e) = self.ping_node(&new_node).await {
                                 eprintln!("Failed to ping new node {}: {}", new_node.addr, e);
                             }
                         }
                     }
                 }
+            }
+
+            if !found_any_new_nodes {
+                consecutive_empty_responses += 1;
+                if consecutive_empty_responses >= MAX_EMPTY_RESPONSES {
+                    break;
+                }
+            } else {
+                consecutive_empty_responses = 0;
             }
 
             if new_closest.is_empty() {
@@ -118,11 +131,28 @@ impl DhtNode {
     }
 
     pub async fn store(&self, key: DhtKey, value: Vec<u8>) -> Result<(), RpcError> {
-        self.storage.lock().await.store(key.clone(), value.clone(), None);
+        let should_store = {
+            let storage = self.storage.lock().await;
+            if let Some(stored_value) = storage.get(&key) {
+                stored_value != value
+            } else {
+                true
+            }
+        };
+
+        if should_store {
+            let mut storage = self.storage.lock().await;
+            storage.store(key.clone(), value.clone(), None);
+        } else {
+            return Ok(());
+        }
 
         let closest = self.find_node(key.clone()).await?;
         if closest.is_empty() {
+            println!("No extra nodes found to store value, storing locally only");
             return Ok(());
+        } else {
+            println!("Found {:?} nodes to store value on", closest);
         }
 
         let mut success_count = 0;

@@ -26,6 +26,7 @@ cargo run -- 4003 127.0.0.1:4000
 # Connect to node 1
 nc 127.0.0.1 4001
 {"Store": ["key1", "value1"]}
+{"Store": ["key3", "value3"]}
 
 {"FindValue": "key1"}
 

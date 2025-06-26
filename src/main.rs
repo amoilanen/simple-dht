@@ -30,6 +30,7 @@ async fn main() -> Result<(), RpcError> {
         node.bootstrap(bootstrap_addr).await?;
     }
 
+    println!("Starting RPC server");
     // Start RPC server
     let server = RpcServer::new(node);
     server.start().await?;

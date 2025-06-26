@@ -170,8 +170,7 @@ impl RpcServer {
             }
 
             RpcRequest::Store(key, value) => {
-                let mut storage = node.storage.lock().await;
-                storage.store(key, value, None);
+                node.store(key, value).await?;
                 Ok(RpcResponse::Ok)
             }
 
